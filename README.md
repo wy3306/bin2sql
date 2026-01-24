@@ -92,7 +92,7 @@ chmod +x build.sh
 | `-big-txn-threshold` | **大事务阈值** | 0 | 0 表示关闭。设置为 >0 的整数开启 |
 
 ## 📂 项目结构
-*   `cmd/` - 程序入口
+*   `main.go` - 程序入口
 *   `pkg/analyzer` - 核心分析逻辑（含多线程调度、大事务检测）
 *   `pkg/seeker` - Binlog 文件定位逻辑（含二分查找、重试机制）
 *   `docs/` - 架构文档

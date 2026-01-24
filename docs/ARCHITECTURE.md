@@ -6,9 +6,7 @@
 
 ```
 bin2sql/
-├── cmd/
-│   └── binlog-analyzer/
-│       └── main.go         # 程序入口，负责参数解析和流程编排
+├── main.go             # 程序入口，负责参数解析和流程编排
 ├── go.mod                  # Go 模块定义
 ├── go.sum                  # Go 依赖校验
 ├── README.md               # 项目使用说明
@@ -23,7 +21,7 @@ bin2sql/
 
 ## 2. 模块说明
 
-### 2.1 主程序 (cmd/binlog-analyzer/main.go)
+### 2.1 主程序 (main.go)
 
 - **职责**：
     1. 解析命令行参数（Host, Port, User, Password, StartTime, EndTime, StartFile 等）。
