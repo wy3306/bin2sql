@@ -1,6 +1,5 @@
 # Binaries
-bin/
-binlog-analyzer
+/binlog-analyzer
 *.exe
 *.dll
 *.so
