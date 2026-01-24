@@ -603,16 +603,50 @@ func (a *Analyzer) PrintStats() {
 
 	// 打印大事务信息
 	a.bigTxnMu.Lock()
-		fmt.Printf("\n=== 发现的大事务 (超过 %d 行) ===\n", a.cfg.BigTxnThreshold)
-		fmt.Printf("共发现 %d 个大事务:\n", len(a.bigTxns))
+	if len(a.bigTxns) > 0 {
+		fmt.Printf("\n=== 大事务分析报告 (阈值 > %d 行) ===\n", a.cfg.BigTxnThreshold)
 		fmt.Printf("共发现 %d 个大事务。\n", len(a.bigTxns))
 
 		// 按行数降序排序
 		sort.Slice(a.bigTxns, func(i, j int) bool {
 			return a.bigTxns[i].Rows > a.bigTxns[j].Rows
 		})
-		// 最多显示前 50 个
-		limit := 50
+
+		// 生成独立报告文件
+		reportFilename := fmt.Sprintf("big_transactions_%s.txt", time.Now().Format("20060102_150405"))
+		file, err := os.Create(reportFilename)
+		if err != nil {
+			fmt.Printf("警告: 无法创建大事务报告文件: %v\n", err)
+		} else {
+			defer file.Close()
+			fmt.Fprintf(file, "=== 大事务分析报告 ===\n")
+			fmt.Fprintf(file, "生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+			fmt.Fprintf(file, "行数阈值: %d\n", a.cfg.BigTxnThreshold)
+			fmt.Fprintf(file, "总数: %d\n\n", len(a.bigTxns))
+
+			for i, txn := range a.bigTxns {
+				duration := txn.EndTime.Sub(txn.StartTime)
+				gtidStr := txn.Gtid
+				if gtidStr == "" {
+					gtidStr = "(无 GTID)"
+				}
+				fmt.Fprintf(file, "[%d]\n", i+1)
+				fmt.Fprintf(file, "  Binlog文件: %s\n", txn.Filename)
+				fmt.Fprintf(file, "  开始时间:   %s\n", txn.StartTime.Format("2006-01-02 15:04:05"))
+				fmt.Fprintf(file, "  结束时间:   %s\n", txn.EndTime.Format("2006-01-02 15:04:05"))
+				fmt.Fprintf(file, "  持续时间:   %v\n", duration)
+				fmt.Fprintf(file, "  影响行数:   %d\n", txn.Rows)
+				fmt.Fprintf(file, "  GTID:       %s\n", gtidStr)
+				if len(txn.Tables) > 0 {
+					fmt.Fprintf(file, "  涉及表:     %v\n", txn.Tables)
+				}
+				fmt.Fprintf(file, "\n")
+			}
+			fmt.Printf("详细大事务报告已保存至独立文件: %s\n", reportFilename)
+		}
+
+		// 终端显示摘要 (前 20 个)
+		limit := 20
 		fmt.Printf("\nTop %d 大事务预览:\n", limit)
 		if len(a.bigTxns) < limit {
 			limit = len(a.bigTxns)
@@ -624,14 +658,12 @@ func (a *Analyzer) PrintStats() {
 			gtidStr := txn.Gtid
 			if gtidStr == "" {
 				gtidStr = "(无 GTID)"
-			fmt.Printf("[%d] 文件: %s | 时间: %s | 耗时: %v | 行数: %d | GTID: %s\n",
-				i+1, txn.Filename, txn.StartTime.Format("2006-01-02 15:04:05"), duration, txn.Rows, gtidStr)
-			if len(txn.Tables) > 0 {
-				fmt.Printf("    涉及表: %v\n", txn.Tables)
 			}
+			// 优化显示格式
+			fmt.Printf("[%d] %s | 行数: %d | 耗时: %v | 开始: %s\n",
 				i+1, txn.Filename, txn.Rows, duration, txn.StartTime.Format("2006-01-02 15:04:05"))
 		}
-			fmt.Printf("... 还有 %d 个大事务未显示 ...\n", len(a.bigTxns)-limit)
+		if len(a.bigTxns) > limit {
 			fmt.Printf("... 更多 %d 个大事务请查看报告文件 ...\n", len(a.bigTxns)-limit)
 		}
 		fmt.Println("--------------------------------")
