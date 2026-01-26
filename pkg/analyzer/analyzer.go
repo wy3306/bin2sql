@@ -218,6 +218,11 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		// 将超时时间延长至 2 分钟，并启用心跳检测（60秒），以解决 I/O Timeout 问题
 		ReadTimeout:     120 * time.Second,
 		HeartbeatPeriod: 60 * time.Second,
+		UseDecimal:      false, // 禁用 Decimal 解码
+		// 某些特殊字符集可能会导致解析错误，尤其是在 go-mysql 较旧版本或特定 MySQL 版本下
+		// 我们主要关注 DML 统计，不需要精确解析每一行数据
+		// 忽略解析错误以防止 panic 导致程序崩溃
+		ParseTime: false,
 	}
 	syncer := replication.NewBinlogSyncer(syncerCfg)
 	defer syncer.Close()
@@ -293,6 +298,10 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 
 	// 4. 事件处理循环（Consumer）
 	firstEventChecked := false
+	eventsProcessed := 0
+	defer func() {
+		// fmt.Printf("[%s] 分析完成，共处理 %d 个事件\n", filename, eventsProcessed)
+	}()
 
 	// 事务状态跟踪
 	var (
@@ -373,6 +382,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		}
 
 		atomic.AddInt64(&a.totalEvents, 1)
+		eventsProcessed++
 
 		// 5. 检查事件时间
 		ts := time.Unix(int64(ev.Header.Timestamp), 0)
@@ -383,13 +393,11 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 			firstEventChecked = true
 			if ts.After(a.cfg.EndTime) {
 				// 不需要合并统计，因为没有有效数据
+				// fmt.Printf("[%s] 首个事件时间 %v 已超过结束时间 %v，跳过分析\n", filename, ts, a.cfg.EndTime)
 				return ErrTimeOver
 			}
 			// 只有通过了快速失败检查的文件，才算作真正开始分析
 			// (注意：这里在多线程下会并发调用，需要锁)
-			// 但如果在单文件模式下已经在 Run() 中添加了，这里再添加会重复吗？
-			// Run() 中只在 len==1 时添加。runParallel 中调用 processBinlogFile 时，len > 1。
-			// 所以这里只需判断 len > 1 时添加。
 			if len(a.cfg.BinlogFiles) > 1 {
 				a.addAnalyzedFile(filename)
 			}
@@ -397,7 +405,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 
 		// 如果当前事件时间已超过结束时间，停止分析该文件
 		if ts.After(a.cfg.EndTime) {
-			// fmt.Printf("[%s] 达到结束时间，停止。\n", filename)
+			// fmt.Printf("[%s] 事件时间 %v 达到结束时间 %v，停止分析\n", filename, ts, a.cfg.EndTime)
 			a.mergeStats(localStats)
 			return nil
 		}
