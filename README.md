@@ -100,3 +100,7 @@ chmod +x build.sh
 *   `pkg/analyzer` - 核心分析逻辑（含多线程调度、大事务检测）
 *   `pkg/seeker` - Binlog 文件定位逻辑（含二分查找、重试机制）
 *   `docs/` - 架构文档
+
+## ⚠️ 注意事项
+
+1.  **GoldenDB 兼容性**：暂不支持 **GoldenDB 61304** 版本。该版本的 Binlog 格式与标准 MySQL 存在差异，可能导致解析失败或数据不准确。建议在该版本数据库上谨慎使用或使用标准 MySQL 客户端工具进行分析。
