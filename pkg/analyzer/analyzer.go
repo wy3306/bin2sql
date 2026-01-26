@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,9 @@ import (
 
 // 定义特定错误，用于通知调度器停止分发
 var ErrTimeOver = fmt.Errorf("binlog time is over end time")
+
+// 用于提取 LogPos 的正则表达式
+var logPosRegex = regexp.MustCompile(`LogPos:0x([0-9a-fA-F]+)`)
 
 // Config 定义分析器的配置参数
 type Config struct {
@@ -224,18 +228,9 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		// 忽略解析错误以防止 panic 导致程序崩溃
 		ParseTime: false,
 	}
-	syncer := replication.NewBinlogSyncer(syncerCfg)
-	defer syncer.Close()
-
-	// 2. 开始同步
-	// 始终从文件头部 (Pos: 4) 开始
-	// fmt.Printf("[%s] 开始分析...\n", filename)
-	streamer, err := syncer.StartSync(mysql.Position{Name: filename, Pos: 4})
-	if err != nil {
-		return err
-	}
 
 	// 3. 启动事件获取协程（Producer）
+	// 注意：syncer 的生命周期现在由 producer 协程管理，以支持错误重试和跳过
 	eventChan := make(chan *replication.BinlogEvent, 10000)
 	errChan := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -244,26 +239,69 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 	go func() {
 		defer close(eventChan)
 		defer close(errChan)
+
+		// 初始位置
+		pos := uint32(4)
+
 		for {
-			select {
-			case <-ctx.Done():
+			// 检查是否取消
+			if ctx.Err() != nil {
 				return
-			default:
 			}
 
-			ev, err := streamer.GetEvent(ctx)
+			syncer := replication.NewBinlogSyncer(syncerCfg)
+			streamer, err := syncer.StartSync(mysql.Position{Name: filename, Pos: pos})
 			if err != nil {
+				errChan <- err
+				syncer.Close()
+				return
+			}
+
+			// 读取循环
+		readLoop:
+			for {
 				if ctx.Err() != nil {
+					syncer.Close()
 					return
 				}
-				errChan <- err
-				return
-			}
 
-			select {
-			case eventChan <- ev:
-			case <-ctx.Done():
-				return
+				ev, err := streamer.GetEvent(ctx)
+				if err != nil {
+					// 尝试解析错误并跳过
+					errStr := err.Error()
+					if strings.Contains(errStr, "parse rows event panic") || strings.Contains(errStr, "Expect odd item") {
+						matches := logPosRegex.FindStringSubmatch(errStr)
+						if len(matches) > 1 {
+							nextPos, pErr := strconv.ParseUint(matches[1], 16, 32)
+							// 确保 nextPos 有效且前进了
+							if pErr == nil && uint32(nextPos) > pos {
+								fmt.Printf("[%s] 警告: 跳过异常事件 (Pos: %d -> %d), 错误: %v\n", filename, pos, nextPos, err)
+								pos = uint32(nextPos)
+								syncer.Close()
+								break readLoop // 跳出读取循环，触发外层重连
+							}
+						}
+					}
+
+					// 无法处理的错误
+					if ctx.Err() == nil {
+						errChan <- err
+					}
+					syncer.Close()
+					return
+				}
+
+				// 更新位置 (LogPos 是下一个事件的位置)
+				if ev.Header.LogPos > 0 {
+					pos = ev.Header.LogPos
+				}
+
+				select {
+				case eventChan <- ev:
+				case <-ctx.Done():
+					syncer.Close()
+					return
+				}
 			}
 		}
 	}()
