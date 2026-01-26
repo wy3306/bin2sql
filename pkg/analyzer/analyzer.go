@@ -761,6 +761,30 @@ func (a *Analyzer) PrintStats() {
 				table, s.Insert, s.Update, s.Delete, s.DDL)
 		}
 	}
+
+	// 导出 DML/DDL 统计报告
+	statsFilename := fmt.Sprintf("dml_ddl_stats_%s.txt", time.Now().Format("20060102_150405"))
+	sFile, err := os.Create(statsFilename)
+	if err != nil {
+		fmt.Printf("警告: 无法创建统计报告文件: %v\n", err)
+	} else {
+		defer sFile.Close()
+		fmt.Fprintf(sFile, "=== DML/DDL 统计报告 ===\n")
+		fmt.Fprintf(sFile, "生成时间: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+
+		for schema, tables := range a.stats {
+			fmt.Fprintf(sFile, "库名: %s\n", schema)
+			for table, s := range tables {
+				if s.Insert == 0 && s.Update == 0 && s.Delete == 0 && s.DDL == 0 {
+					continue
+				}
+				fmt.Fprintf(sFile, "  表名: %s -> 插入: %d, 更新: %d, 删除: %d, DDL: %d\n",
+					table, s.Insert, s.Update, s.Delete, s.DDL)
+			}
+			fmt.Fprintf(sFile, "\n")
+		}
+		fmt.Printf("详细统计报告已保存至独立文件: %s\n", statsFilename)
+	}
 }
 
 // isDDL 简单判断 SQL 语句是否为 DDL
