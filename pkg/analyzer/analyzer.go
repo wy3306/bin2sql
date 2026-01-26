@@ -214,6 +214,8 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		Port:     uint16(a.cfg.Port),
 		User:     a.cfg.User,
 		Password: a.cfg.Password,
+		// 增加读取超时时间，防止网络波动导致连接中断
+		ReadTimeout: 30 * time.Second,
 	}
 	syncer := replication.NewBinlogSyncer(syncerCfg)
 	defer syncer.Close()
