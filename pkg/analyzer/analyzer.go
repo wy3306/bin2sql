@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -240,6 +241,33 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		defer close(eventChan)
 		defer close(errChan)
 
+		// 追踪当前的 syncer 实例，以便在 panic 时关闭连接
+		var currentSyncer *replication.BinlogSyncer
+
+		// 添加 Panic 恢复机制
+		defer func() {
+			if r := recover(); r != nil {
+				// 关闭连接防止泄露
+				if currentSyncer != nil {
+					currentSyncer.Close()
+				}
+
+				// 获取堆栈信息
+				const size = 64 << 10
+				buf := make([]byte, size)
+				buf = buf[:runtime.Stack(buf, false)]
+
+				errMsg := fmt.Errorf("panic runtime error: %v", r)
+				fmt.Printf("[%s] 严重错误: 发生 Panic, 停止分析该文件. 错误: %v\n堆栈:\n%s\n", filename, r, buf)
+
+				// 发送错误到通道
+				select {
+				case errChan <- errMsg:
+				default:
+				}
+			}
+		}()
+
 		// 初始位置
 		pos := uint32(4)
 
@@ -250,6 +278,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 			}
 
 			syncer := replication.NewBinlogSyncer(syncerCfg)
+			currentSyncer = syncer // 更新当前实例
 			streamer, err := syncer.StartSync(mysql.Position{Name: filename, Pos: pos})
 			if err != nil {
 				errChan <- err
