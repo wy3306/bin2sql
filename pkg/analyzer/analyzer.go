@@ -215,7 +215,9 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		User:     a.cfg.User,
 		Password: a.cfg.Password,
 		// 增加读取超时时间，防止网络波动导致连接中断
-		ReadTimeout: 30 * time.Second,
+		// 将超时时间延长至 2 分钟，并启用心跳检测（60秒），以解决 I/O Timeout 问题
+		ReadTimeout:     120 * time.Second,
+		HeartbeatPeriod: 60 * time.Second,
 	}
 	syncer := replication.NewBinlogSyncer(syncerCfg)
 	defer syncer.Close()
