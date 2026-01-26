@@ -353,12 +353,13 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		case ev, ok = <-eventChan:
 			if !ok {
 				// Channel Closed
+				// 必须在这里合并统计数据，否则数据会丢失
+				a.mergeStats(localStats)
+
 				select {
 				case err := <-errChan:
-					a.mergeStats(localStats)
 					return err
 				default:
-					a.mergeStats(localStats)
 					return nil
 				}
 			}
