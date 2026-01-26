@@ -47,6 +47,7 @@ chmod +x build.sh
 ./bin/binlog-analyzer-linux-amd64 \
   -host 192.168.1.100 \
   -user root \
+  -port 3306 \
   -password "123456" \
   -start-time "2026-01-25 00:00:00" \
   -end-time "2026-01-25 01:00:00"
@@ -60,6 +61,7 @@ chmod +x build.sh
 ./bin/binlog-analyzer-linux-amd64 \
   -host 192.168.1.100 \
   -user root \
+  -port 3306 \
   -start-time "2026-01-25 00:00:00" \
   -end-time "2026-01-25 01:00:00" \
   -big-txn-threshold 5000
