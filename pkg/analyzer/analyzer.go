@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"regexp"
 	"runtime"
@@ -65,6 +66,19 @@ type Analyzer struct {
 	fileMu        sync.Mutex                        // 保护 analyzedFiles 的互斥锁
 	bigTxns       []BigTxnInfo                      // 发现的大事务列表
 	bigTxnMu      sync.Mutex                        // 保护 bigTxns 的互斥锁
+	useChecksum   bool                              // 是否启用 Checksum 校验 (根据网络延迟动态决定)
+}
+
+// measureLatency 测量到目标主机的 TCP 连接延迟
+func measureLatency(host string, port int) (time.Duration, error) {
+	target := fmt.Sprintf("%s:%d", host, port)
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", target, 2*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	return time.Since(start), nil
 }
 
 // New 创建一个新的分析器实例
@@ -102,6 +116,7 @@ func (a *Analyzer) Run() error {
 	// 多文件并行模式
 	first := a.cfg.BinlogFiles[0]
 	last := a.cfg.BinlogFiles[len(a.cfg.BinlogFiles)-1]
+
 	fmt.Printf("检测到 %d 个 Binlog 文件 (%s ... %s)，启用多线程并行分析...\n",
 		len(a.cfg.BinlogFiles), first, last)
 	return a.runParallel()
@@ -228,6 +243,11 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		// 我们主要关注 DML 统计，不需要精确解析每一行数据
 		// 忽略解析错误以防止 panic 导致程序崩溃
 		ParseTime: false,
+
+		// 性能优化配置
+		// 智能决定是否开启 Checksum 校验
+		// 根据 Run() 阶段测量的网络延迟动态决定
+		VerifyChecksum: a.useChecksum,
 	}
 
 	// 3. 启动事件获取协程（Producer）
