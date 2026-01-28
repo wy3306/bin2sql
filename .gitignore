@@ -5,6 +5,9 @@
 *.so
 *.dylib
 
+# Reports
+bin/*.txt
+
 # IDEs
 .idea/
 .vscode/

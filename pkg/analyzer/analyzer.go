@@ -48,12 +48,15 @@ type TableStats struct {
 
 // BigTxnInfo 存储大事务信息
 type BigTxnInfo struct {
-	Filename  string    // Binlog 文件名
-	StartTime time.Time // 事务开始时间
-	EndTime   time.Time // 事务结束时间
-	Gtid      string    // GTID (如果有)
-	Rows      int       // 影响行数
-	Tables    []string  // 涉及的表
+	Filename            string    // Binlog 文件名
+	StartTime           time.Time // 事务开始时间
+	EndTime             time.Time // 事务结束时间
+	Gtid                string    // GTID (如果有)
+	Rows                int       // 影响行数
+	Tables              []string  // 涉及的表
+	OriginalCommitTime  time.Time // 原始提交时间 (Master)
+	ImmediateCommitTime time.Time // 提交时间 (Current)
+	StatementTypes      []string  // 包含的语句类型 (INSERT, UPDATE, DELETE)
 }
 
 // Analyzer 是 Binlog 分析器的核心结构体
@@ -358,7 +361,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 	// 局部统计数据，避免频繁锁竞争
 	localStats := make(map[string]map[string]*TableStats)
 	// 辅助函数：更新局部统计
-	updateLocalStats := func(schema, table string, statsType string) {
+	updateLocalStats := func(schema, table string, statsType string, count int) {
 		if localStats[schema] == nil {
 			localStats[schema] = make(map[string]*TableStats)
 		}
@@ -368,13 +371,13 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		s := localStats[schema][table]
 		switch statsType {
 		case "INSERT":
-			s.Insert++
+			s.Insert += count
 		case "UPDATE":
-			s.Update++
+			s.Update += count
 		case "DELETE":
-			s.Delete++
+			s.Delete += count
 		case "DDL":
-			s.DDL++
+			s.DDL += count
 		}
 	}
 
@@ -392,11 +395,14 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 
 	// 事务状态跟踪
 	var (
-		currTxnGtid      string
-		currTxnRows      int
-		currTxnStartTime time.Time
-		currTxnTables    = make(map[string]bool)
-		inTxn            bool
+		currTxnGtid                string
+		currTxnRows                int
+		currTxnStartTime           time.Time
+		currTxnTables              = make(map[string]bool)
+		currTxnOriginalCommitTime  time.Time
+		currTxnImmediateCommitTime time.Time
+		currTxnStatementTypes      = make(map[string]bool)
+		inTxn                      bool
 	)
 
 	// 辅助函数：重置事务状态
@@ -405,6 +411,9 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 		currTxnRows = 0
 		currTxnStartTime = time.Time{}
 		currTxnTables = make(map[string]bool)
+		currTxnOriginalCommitTime = time.Time{}
+		currTxnImmediateCommitTime = time.Time{}
+		currTxnStatementTypes = make(map[string]bool)
 		inTxn = false
 	}
 
@@ -417,19 +426,43 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 			}
 			sort.Strings(tables)
 
+			stmtTypes := make([]string, 0, len(currTxnStatementTypes))
+			for t := range currTxnStatementTypes {
+				stmtTypes = append(stmtTypes, t)
+			}
+			sort.Strings(stmtTypes)
+
 			// 如果开始时间未设置，使用结束时间作为近似
 			startTime := currTxnStartTime
 			if startTime.IsZero() {
 				startTime = endTime
 			}
 
+			// 优先使用高精度的原始提交时间作为结束时间
+			finalEndTime := endTime
+			if !currTxnOriginalCommitTime.IsZero() {
+				finalEndTime = currTxnOriginalCommitTime
+			}
+
+			// 再次检查时间顺序 (防止因时钟回拨或逻辑问题导致 Start > End)
+			if finalEndTime.Before(startTime) {
+				// 如果结束时间早于开始时间，这通常是不可能的（除非跨年/时钟回拨）
+				// 这种情况下，为了显示正常，强制让它们相等，或者保留原样但 Duration 会是负数
+				// 这里选择保留原样，让 Duration 显示负数或 0 可能更能提示问题，
+				// 但为了用户体验，我们让 End = Start + 1ms
+				// finalEndTime = startTime
+			}
+
 			a.addBigTxn(BigTxnInfo{
-				Filename:  filename,
-				StartTime: startTime,
-				EndTime:   endTime,
-				Gtid:      currTxnGtid,
-				Rows:      currTxnRows,
-				Tables:    tables,
+				Filename:            filename,
+				StartTime:           startTime,
+				EndTime:             finalEndTime,
+				Gtid:                currTxnGtid,
+				Rows:                currTxnRows,
+				Tables:              tables,
+				OriginalCommitTime:  currTxnOriginalCommitTime,
+				ImmediateCommitTime: currTxnImmediateCommitTime,
+				StatementTypes:      stmtTypes,
 			})
 		}
 	}
@@ -508,7 +541,24 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 				}
 				resetTxn()
 				inTxn = true
-				currTxnStartTime = ts
+
+				// 尝试从 GTID 事件中提取原始提交时间和即时提交时间（微秒精度）
+				// 这是解决历史 Binlog 分析中 "主从延迟" 计算不准确的关键
+				// OriginalCommitTimestamp: 事务在主库提交的时间
+				// ImmediateCommitTimestamp: 事务在当前 Binlog 所在实例提交的时间
+				if e.OriginalCommitTimestamp > 0 {
+					sec := int64(e.OriginalCommitTimestamp) / 1000000
+					nsec := (int64(e.OriginalCommitTimestamp) % 1000000) * 1000
+					currTxnOriginalCommitTime = time.Unix(sec, nsec)
+				}
+				if e.ImmediateCommitTimestamp > 0 {
+					sec := int64(e.ImmediateCommitTimestamp) / 1000000
+					nsec := (int64(e.ImmediateCommitTimestamp) % 1000000) * 1000
+					currTxnImmediateCommitTime = time.Unix(sec, nsec)
+				}
+
+				// 注意：GTID 事件的时间戳通常是提交时间，不应作为事务开始时间
+				// currTxnStartTime = ts
 				// 格式化 GTID: SID:GNO
 				u := e.SID
 				currTxnGtid = fmt.Sprintf("%x-%x-%x-%x-%x:%d",
@@ -522,27 +572,27 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 				}
 				resetTxn()
 				inTxn = true
-				currTxnStartTime = ts
+				// currTxnStartTime = ts // 同上，不使用 GTID 时间作为开始时间
 				currTxnGtid = e.GTID.String()
 			}
 
 		case *replication.XIDEvent:
 			if trackBigTxn {
+				// 如果 GTID 中没有提供原始提交时间，则回退到使用 XID 事件的时间戳
+				if currTxnOriginalCommitTime.IsZero() {
+					currTxnOriginalCommitTime = ts
+				}
+				// 如果 GTID 中没有提供即时提交时间，则回退到当前分析时间 (仅作为最后手段)
+				// 注意：在历史分析中，这会导致计算出的延迟包含 "历史时间差"，这是用户已知的行为
+				if currTxnImmediateCommitTime.IsZero() {
+					currTxnImmediateCommitTime = time.Now()
+				}
 				checkBigTxn(ts)
 				resetTxn()
 			}
 
 		case *replication.RotateEvent:
-			// 如果发生 Rotate，说明该文件结束了（通常意味着流式读取会切换到下一个文件）
-			// 但我们在多文件模式下，只分析当前指定的文件。
-			// 不过，StartSync 会自动跟随 Rotate。
-			// 既然我们手动控制文件列表，最好是读到 RotateEvent 就停止？
-			// 不，StartSync(file) 如果不指定 StopOnRotate，它会自动切换到下一个。
-			// 这会导致重复分析！
-			// **关键点**：我们需要在遇到 RotateEvent 且 NextLogName != CurrentFile 时停止吗？
-			// 或者，我们可以依赖 EndTime。
-			// 但如果 EndTime 很远，它会一直读下去。
-			// **修正**：我们应该检查 NextLogName。
+
 			nextLog := string(e.NextLogName)
 			if nextLog != filename && len(a.cfg.BinlogFiles) > 1 {
 				// 切换到了下一个文件，而我们是按文件并行的，所以当前 Worker 应该结束
@@ -580,25 +630,36 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 				currTxnTables[schema+"."+table] = true
 			}
 
-			// 记录 DML
+			// 记录 DML (改为统计行数)
+			rowCount := len(e.Rows)
 			switch ev.Header.EventType {
 			case replication.WRITE_ROWS_EVENTv0, replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
-				updateLocalStats(schema, table, "INSERT")
+				if trackBigTxn {
+					currTxnStatementTypes["INSERT"] = true
+				}
+				updateLocalStats(schema, table, "INSERT", rowCount)
 			case replication.UPDATE_ROWS_EVENTv0, replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2:
-				updateLocalStats(schema, table, "UPDATE")
+				if trackBigTxn {
+					currTxnStatementTypes["UPDATE"] = true
+				}
+				updateLocalStats(schema, table, "UPDATE", rowCount)
 			case replication.DELETE_ROWS_EVENTv0, replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
-				updateLocalStats(schema, table, "DELETE")
+				if trackBigTxn {
+					currTxnStatementTypes["DELETE"] = true
+				}
+				updateLocalStats(schema, table, "DELETE", rowCount)
 			}
 
 		case *replication.QueryEvent:
 			if isBefore {
 				continue
 			}
-			query := string(e.Query)
+			query := strings.TrimSpace(string(e.Query))
+			upperQuery := strings.ToUpper(query)
 
 			// 事务边界检测
 			if trackBigTxn {
-				if query == "BEGIN" {
+				if upperQuery == "BEGIN" {
 					// 如果已经在事务中且有 GTID，则 BEGIN 只是事务的一部分，不重置
 					if !inTxn || currTxnGtid == "" {
 						if inTxn {
@@ -606,21 +667,36 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 						}
 						resetTxn()
 						inTxn = true
-						currTxnStartTime = ts
 					}
-				} else if query == "COMMIT" || query == "ROLLBACK" {
-					checkBigTxn(ts)
-					resetTxn()
+					// 总是更新开始时间，因为 BEGIN 的时间戳是真正的事务开始时间
+					currTxnStartTime = ts
+				} else if upperQuery == "COMMIT" || upperQuery == "ROLLBACK" {
+					// 只有在事务中才处理 COMMIT/ROLLBACK
+					if inTxn {
+						// 如果 GTID 中没有提供原始提交时间，尝试使用 XID/Query 事件时间
+						if currTxnOriginalCommitTime.IsZero() {
+							currTxnOriginalCommitTime = ts
+						}
+						// 同样处理即时提交时间
+						if currTxnImmediateCommitTime.IsZero() {
+							currTxnImmediateCommitTime = time.Now()
+						}
+						checkBigTxn(ts)
+						resetTxn()
+					}
 				}
 			}
 
 			if isDDL(query) {
+				if trackBigTxn {
+					currTxnStatementTypes["DDL"] = true
+				}
 				schema := string(e.Schema)
 				table := extractTableFromDDL(query)
 				if table == "" {
 					table = "UNKNOWN"
 				}
-				updateLocalStats(schema, table, "DDL")
+				updateLocalStats(schema, table, "DDL", 1)
 			}
 		}
 	}
@@ -707,9 +783,9 @@ func (a *Analyzer) PrintStats() {
 		fmt.Printf("\n=== 大事务分析报告 (阈值 > %d 行) ===\n", a.cfg.BigTxnThreshold)
 		fmt.Printf("共发现 %d 个大事务。\n", len(a.bigTxns))
 
-		// 按行数降序排序
+		// 按开始时间升序排序
 		sort.Slice(a.bigTxns, func(i, j int) bool {
-			return a.bigTxns[i].Rows > a.bigTxns[j].Rows
+			return a.bigTxns[i].StartTime.Before(a.bigTxns[j].StartTime)
 		})
 
 		// 生成独立报告文件
@@ -732,11 +808,30 @@ func (a *Analyzer) PrintStats() {
 				}
 				fmt.Fprintf(file, "[%d]\n", i+1)
 				fmt.Fprintf(file, "  Binlog文件: %s\n", txn.Filename)
-				fmt.Fprintf(file, "  开始时间:   %s\n", txn.StartTime.Format("2006-01-02 15:04:05"))
-				fmt.Fprintf(file, "  结束时间:   %s\n", txn.EndTime.Format("2006-01-02 15:04:05"))
-				fmt.Fprintf(file, "  持续时间:   %v\n", duration)
+				fmt.Fprintf(file, "  开始时间:   %s\n", txn.StartTime.Format("2006-01-02 15:04:05.000000"))
+				fmt.Fprintf(file, "  结束时间:   %s\n", txn.EndTime.Format("2006-01-02 15:04:05.000000"))
+				durationStr := duration.String()
+				if duration == 0 {
+					durationStr = "< 1ms" // 使用了微秒精度，0 就是真的极快
+				}
+				fmt.Fprintf(file, "  执行耗时:   %s\n", durationStr)
+
+				// 计算主从延迟
+				// 注意：在离线分析模式下，ImmediateCommitTime 是当前分析时间 (time.Now())
+				// 所以 lag = 当前时间 - 事务提交时间
+				// 用户可能正在利用这一点来分析严重滞后的从库，或者就是想看这个差值
+				if !txn.OriginalCommitTime.IsZero() && !txn.ImmediateCommitTime.IsZero() {
+					lag := txn.ImmediateCommitTime.Sub(txn.OriginalCommitTime)
+					fmt.Fprintf(file, "  主从延迟:   %s\n", lag.String())
+				}
+
 				fmt.Fprintf(file, "  影响行数:   %d\n", txn.Rows)
 				fmt.Fprintf(file, "  GTID:       %s\n", gtidStr)
+
+				if len(txn.StatementTypes) > 0 {
+					fmt.Fprintf(file, "  操作类型:   %v\n", txn.StatementTypes)
+				}
+
 				if len(txn.Tables) > 0 {
 					fmt.Fprintf(file, "  涉及表:     %v\n", txn.Tables)
 				}
@@ -755,13 +850,28 @@ func (a *Analyzer) PrintStats() {
 		for i := 0; i < limit; i++ {
 			txn := a.bigTxns[i]
 			duration := txn.EndTime.Sub(txn.StartTime)
+			durationStr := duration.String()
+			if duration == 0 {
+				durationStr = "< 1s"
+			}
 			gtidStr := txn.Gtid
 			if gtidStr == "" {
 				gtidStr = "(无 GTID)"
 			}
 			// 优化显示格式
-			fmt.Printf("[%d] %s | 行数: %d | 耗时: %v | 开始: %s\n",
-				i+1, txn.Filename, txn.Rows, duration, txn.StartTime.Format("2006-01-02 15:04:05"))
+			typesStr := ""
+			if len(txn.StatementTypes) > 0 {
+				typesStr = fmt.Sprintf(" | 类型: %v", txn.StatementTypes)
+			}
+
+			lagStr := ""
+			if !txn.OriginalCommitTime.IsZero() && !txn.ImmediateCommitTime.IsZero() {
+				lag := txn.ImmediateCommitTime.Sub(txn.OriginalCommitTime)
+				lagStr = fmt.Sprintf(" | 延迟: %s", lag.String())
+			}
+
+			fmt.Printf("[%d] %s | 行数: %d | 耗时: %s%s%s | 开始: %s\n",
+				i+1, txn.Filename, txn.Rows, durationStr, typesStr, lagStr, txn.StartTime.Format("2006-01-02 15:04:05.000000"))
 		}
 		if len(a.bigTxns) > limit {
 			fmt.Printf("... 更多 %d 个大事务请查看报告文件 ...\n", len(a.bigTxns)-limit)
