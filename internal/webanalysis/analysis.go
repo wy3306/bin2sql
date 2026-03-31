@@ -270,8 +270,9 @@ func (s *analyzerState) processFilesParallel(ctx context.Context, files []string
 	nextIndex := 0
 	active := 0
 
-	updateProgress := func(message string, snap resourceSnapshot) {
+	updateProgress := func(message string, currentFile string, snap resourceSnapshot) {
 		s.progress.Phase = "running"
+		s.progress.CurrentFile = currentFile
 		s.progress.FilesCompleted = s.filesCompleted
 		s.progress.FilesTotal = len(files)
 		s.progress.Message = message
@@ -294,7 +295,7 @@ func (s *analyzerState) processFilesParallel(ctx context.Context, files []string
 				active++
 
 				localState := newPartialAnalyzerState(s.cfg, s.bucketSize)
-				updateProgress(fmt.Sprintf("并行分析中，活跃任务 %d/%d，启动 %s", active, targetConcurrency, filename), snap)
+				updateProgress(fmt.Sprintf("并行分析中，活跃任务 %d/%d，启动 %s", active, targetConcurrency, filename), filename, snap)
 
 				go func(file string, local *analyzerState) {
 					err := local.processStream(ctx, file, false)
@@ -309,6 +310,11 @@ func (s *analyzerState) processFilesParallel(ctx context.Context, files []string
 		}
 
 		if active == 0 {
+			if stopScheduling || nextIndex >= len(files) {
+				break
+			}
+			updateProgress(fmt.Sprintf("并行分析中，已完成 %d/%d，等待分配下一个文件", s.filesCompleted, len(files)), s.progress.CurrentFile, snap)
+			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 
@@ -326,9 +332,13 @@ func (s *analyzerState) processFilesParallel(ctx context.Context, files []string
 			s.progress.EventsProcessed += fileResult.state.progress.EventsProcessed
 
 			targetConcurrency, snap = monitor.recommendedConcurrency(maxConcurrency)
-			updateProgress(fmt.Sprintf("并行分析中，已完成 %d/%d，活跃任务 %d/%d，最近完成 %s", s.filesCompleted, len(files), active, targetConcurrency, fileResult.filename), snap)
+			currentFile := s.progress.CurrentFile
+			if active == 0 {
+				currentFile = ""
+			}
+			updateProgress(fmt.Sprintf("并行分析中，已完成 %d/%d，活跃任务 %d/%d，最近完成 %s", s.filesCompleted, len(files), active, targetConcurrency, fileResult.filename), currentFile, snap)
 		case <-time.After(1200 * time.Millisecond):
-			updateProgress(fmt.Sprintf("并行分析中，已完成 %d/%d，活跃任务 %d/%d", s.filesCompleted, len(files), active, targetConcurrency), snap)
+			updateProgress(fmt.Sprintf("并行分析中，已完成 %d/%d，活跃任务 %d/%d", s.filesCompleted, len(files), active, targetConcurrency), s.progress.CurrentFile, snap)
 		}
 	}
 
