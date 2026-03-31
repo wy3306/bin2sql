@@ -617,7 +617,14 @@ func (s *analyzerState) processStream(ctx context.Context, filename string, foll
 				ts := time.Unix(int64(ev.Header.Timestamp), 0)
 				query := strings.ToUpper(strings.TrimSpace(string(e.Query)))
 				if query == "BEGIN" {
-					s.startTransaction(ts)
+					// GTID 事务通常会先收到 GTIDEvent，再收到 BEGIN。
+					// 这里如果直接重置事务状态，会把 GTID 携带的 transaction_length 清零，
+					// 导致 Web 端把大事务错误显示成几百字节甚至 0。
+					if !s.inTxn || s.currentGTID == "" {
+						s.startTransaction(ts)
+					} else {
+						s.txnStart = ts
+					}
 					continue
 				}
 				if query == "COMMIT" || query == "ROLLBACK" {
