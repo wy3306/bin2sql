@@ -2,6 +2,21 @@
 
 这是一个高性能的 MySQL Binlog 分析工具，专为统计数据库操作（DML/DDL）和大事务分析而设计。
 
+## 📅 版本更新日志 (2026-03-31)
+
+### 🌟 核心升级
+1.  **Web 分析并行化**：
+    *   Web 端分析不再局限于单文件串行处理；在可枚举 Binlog 文件时，会自动启用多文件并行分析。
+    *   Web 任务状态会持续显示并行分析进度，便于观察当前任务推进情况。
+2.  **资源自适应调度**：
+    *   Web 并行分析会按本机资源动态调整 Worker 数量。
+    *   当前默认约束目标为：CPU 不超过 70%，内存不超过 80%，带宽不超过 90%。
+    *   当资源采样不可用时，会回退到保守并发策略。
+3.  **发布包结构完善**：
+    *   新增 `webctl.sh`，支持使用 Shell 脚本统一管理 Web 服务。
+    *   发布包中补齐 `config/`、`logs/`、`webui/assets/` 目录，解压后即可直接运行。
+    *   Web 日志与 PID 文件迁移到独立的 `logs/` 目录。
+
 ## 📅 版本更新日志 (2026-01-28)
 
 ### 🌟 核心升级
@@ -38,8 +53,8 @@
     *   引入 Worker Pool 模式，自动并发分析多个 Binlog 文件。
     *   在处理大量 Binlog 时，性能提升显著（取决于 CPU 核心数）。
 2.  **大事务分析 (Big Transaction Analysis)**：
-    *   支持按“影响行数”阈值识别大事务。
-    *   **独立报告**：自动生成独立的 `big_transactions_*.txt` 文件，详细记录大事务的 GTID、开始/结束时间、耗时、行数及涉及表。
+    *   支持按“影响行数”或“事务占用字节大小（`transaction_length`）”阈值识别大事务。
+    *   **独立报告**：自动生成独立的 `big_transactions_*.txt` 文件，详细记录大事务的 GTID、开始/结束时间、耗时、行数、事务字节大小及涉及表。
     *   **零开销设计**：默认关闭。未开启时（阈值为 0），对性能无任何额外影响。
 3.  **智能性能优化 (Smart Checksum)**：
     *   **低延迟极速模式**：启动时自动测量到数据库的 TCP 网络延迟。如果延迟 < 10ms（通常为局域网），自动关闭 Checksum 校验以最大化速度。
@@ -90,6 +105,84 @@ chmod +x build.sh
 *   `bin/binlog-analyzer-linux-arm64`
 *   `bin/binlog-analyzer-darwin-arm64` (Mac M1/M2/M3)
 
+### 1.1 Web 控制台
+
+项目新增了一个独立的 Web 入口，**不会影响原有 CLI 分析方式**。  
+Web 服务默认监听 `0.0.0.0:9000`，适合在局域网内访问，页面资源全部为本地静态资源，不依赖外网 CDN。
+
+启动：
+```bash
+sh start-web.sh
+```
+
+停止：
+```bash
+sh stop-web.sh
+```
+
+统一管理：
+```bash
+sh webctl.sh start
+sh webctl.sh stop
+sh webctl.sh restart
+sh webctl.sh status
+sh webctl.sh logs
+```
+
+默认访问地址：
+```text
+http://<当前主机IP>:9000
+```
+
+默认日志目录：
+```text
+logs/binlog-web.log
+logs/binlog-web.pid
+```
+
+Web 页面支持：
+*   输入与 CLI 一致的分析参数：`-host`、`-port`、`-user`、`-password`、`-start-time`、`-end-time`、`-start-file`、`-big-txn-threshold`、`-big-txn-mode`、`-big-txn-bytes-threshold`
+*   通过时间范围筛选折线图显示区间
+*   点击时间桶查看该时间段的 DML 明细
+*   查看按表聚合的 DML 热点
+*   提示大事务信息（开启阈值时）
+*   在可枚举多个 Binlog 文件时启用并行分析
+*   根据本机 CPU / 内存 / 带宽占用自动调整并发度
+
+### 1.2 Linux AMD64 发布包
+
+执行：
+```bash
+sh package-linux-amd64.sh
+```
+
+生成产物：
+```text
+dist/bin2sql-linux-amd64.tar.gz
+```
+
+压缩包解压后顶层目录固定为 `bin2sql/`，包含：
+```text
+bin2sql/
+├── bin/
+│   ├── binlog-analyzer
+│   └── binlog-web
+├── config/
+├── logs/
+├── webui/assets/
+├── start-web.sh
+├── stop-web.sh
+├── webctl.sh
+└── README.md
+```
+
+部署后常用命令：
+```bash
+tar -xzf bin2sql-linux-amd64.tar.gz
+cd bin2sql
+sh webctl.sh start
+```
+
 ### 2. 基础用法 (统计 DML/DDL)
 最常用的模式，统计指定时间段内各表的 Insert/Update/Delete/DDL 次数。
 
@@ -104,7 +197,7 @@ chmod +x build.sh
 ```
 
 ### 3. 进阶用法 (开启大事务分析)
-如果您怀疑数据库有大事务导致主从延迟，可以使用 `-big-txn-threshold` 参数。
+如果您怀疑数据库有大事务导致主从延迟，可以按行数或按事务字节大小来识别。
 
 **示例：查找影响行数超过 5000 行的事务**
 ```bash
@@ -118,6 +211,18 @@ chmod +x build.sh
 ```
 *   **终端输出**：显示 Top 20 大事务摘要。
 *   **文件输出**：在当前目录生成 `big_transactions_20260125_xxxx.txt`，包含完整详情。
+
+**示例：查找 `transaction_length` 超过 64MB 的事务**
+```bash
+./bin/binlog-analyzer-linux-amd64 \
+  -host 192.168.1.100 \
+  -user root \
+  -port 3306 \
+  -start-time "2026-01-25 00:00:00" \
+  -end-time "2026-01-25 01:00:00" \
+  -big-txn-mode bytes \
+  -big-txn-bytes-threshold 67108864
+```
 
 ### 4. 特殊场景 (手动指定起始文件)
 如果您的数据库权限受限（不支持 `SHOW BINARY LOGS`），或者是云数据库，您可以手动指定第一个 Binlog 文件：
@@ -142,6 +247,8 @@ chmod +x build.sh
 | `-end-time` | **结束时间** | (必填) | 格式: YYYY-MM-DD HH:MM:SS |
 | `-start-file` | 起始文件 | (空) | 用于绕过自动查找逻辑 |
 | `-big-txn-threshold` | **大事务阈值** | 0 | 0 表示关闭。设置为 >0 的整数开启 |
+| `-big-txn-mode` | **大事务判定模式** | rows | `rows` 或 `bytes` |
+| `-big-txn-bytes-threshold` | **大事务字节阈值** | 0 | 使用 `GTIDEvent.TransactionLength`，仅 `bytes` 模式生效 |
 
 ## 📂 项目结构
 *   `main.go` - 程序入口
@@ -152,3 +259,5 @@ chmod +x build.sh
 ## ⚠️ 注意事项
 
 1.  **GoldenDB 兼容性(基于MySQL的分布式数据库)**：暂不支持 **GoldenDB 61304** 版本。该版本的 Binlog 格式与标准 MySQL 存在差异，可能导致解析失败或数据不准确。
+2.  **字节模式限制**：`bytes` 模式依赖 MySQL Binlog 中的 `GTIDEvent.TransactionLength` 元数据。若源端未提供该字段，对应事务的字节值会是 0，因此不会被字节阈值识别为大事务。
+3.  **资源自适应的边界**：当前 Web 并行调度只根据**分析机本机资源**自动控并发，不能直接保证对端 MySQL 主机资源一定不受影响。生产环境建议结合低峰时段、小时间范围和保守初始并发使用。

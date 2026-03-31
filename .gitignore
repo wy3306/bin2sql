@@ -7,6 +7,12 @@
 
 # Reports
 bin/*.txt
+bin/binlog-web
+bin/binlog-web.log
+bin/binlog-web.pid
+logs/*.log
+logs/*.pid
+dist/
 
 # IDEs
 .idea/

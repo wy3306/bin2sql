@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MySQL/GoldenDB事务分析工具</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">BINLOG ANALYZER</p>
+        <h1>MySQL/GoldenDB事务分析工具</h1>
+      </div>
+      <div class="topbar-actions">
+        <button id="cleanupBtn" type="button" class="secondary">清理分析文件</button>
+        <button id="closePageBtn" type="button" class="danger-button">关闭程序</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel control-panel">
+        <div class="panel-head">
+          <h2>分析参数</h2>
+        </div>
+
+        <form id="analyzeForm" class="form-grid">
+          <label>
+            <span>-host</span>
+            <input id="host" name="host" type="text" value="127.0.0.1" required>
+          </label>
+          <label>
+            <span>-port</span>
+            <input id="port" name="port" type="number" value="3306" min="1" max="65535" required>
+          </label>
+          <label>
+            <span>-user</span>
+            <input id="user" name="user" type="text" value="root" required>
+          </label>
+          <label>
+            <span>-password</span>
+            <input id="password" name="password" type="password" autocomplete="off">
+          </label>
+          <label>
+            <span>-start-time</span>
+            <input id="startTime" name="startTime" type="datetime-local" step="1" required>
+          </label>
+          <label>
+            <span>-end-time</span>
+            <input id="endTime" name="endTime" type="datetime-local" step="1" required>
+          </label>
+          <label>
+            <span>-start-file</span>
+            <input id="startFile" name="startFile" type="text" placeholder="mysql-bin.000123">
+          </label>
+          <label>
+            <span id="bigTxnThresholdLabel">-big-txn-threshold</span>
+            <input id="bigTxnThreshold" name="bigTxnThreshold" type="number" min="0" value="0">
+          </label>
+          <label>
+            <span>-big-txn-mode</span>
+            <select id="bigTxnMode" name="bigTxnMode">
+              <option value="rows">按影响行数</option>
+              <option value="bytes">按事务字节</option>
+            </select>
+          </label>
+          <label>
+            <span id="bigTxnBytesThresholdLabel">-big-txn-bytes-threshold</span>
+            <input id="bigTxnBytesThreshold" name="bigTxnBytesThreshold" type="number" min="0" value="0">
+          </label>
+
+          <div class="form-actions">
+            <button id="submitBtn" type="submit" class="primary">开始分析</button>
+            <button id="fillLastHourBtn" type="button" class="secondary">最近 1 小时</button>
+          </div>
+        </form>
+
+        <div class="cli-preview">
+          <div class="panel-head compact">
+            <h3>CLI 预览</h3>
+          </div>
+          <pre id="cliPreview"></pre>
+        </div>
+      </section>
+
+      <section class="panel status-panel">
+        <div class="panel-head">
+          <h2>任务状态</h2>
+        </div>
+
+        <div class="status-grid">
+          <article class="metric-card">
+            <span>状态</span>
+            <strong id="taskStatus" class="status-value">空闲</strong>
+          </article>
+          <article class="metric-card">
+            <span>当前文件</span>
+            <strong id="currentFile" class="file-value">-</strong>
+          </article>
+          <article class="metric-card">
+            <span>已处理事件</span>
+            <strong id="eventsProcessed">0</strong>
+          </article>
+          <article class="metric-card">
+            <span>已完成文件</span>
+            <strong id="filesProgress">0 / 0</strong>
+          </article>
+        </div>
+
+        <div class="log-box">
+          <div class="log-title">运行日志</div>
+          <div id="progressMessage" class="log-content">等待任务启动</div>
+        </div>
+
+        <div class="task-list">
+          <div class="panel-head compact">
+            <h3>最近任务</h3>
+          </div>
+          <div id="taskHistory" class="task-history empty">暂无任务记录</div>
+        </div>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-head">
+          <h2>DML 时间轴</h2>
+        </div>
+
+        <div class="timeline-toolbar">
+          <label class="range-display-field">
+            <span>开始时间</span>
+            <input id="rangeFrom" type="datetime-local" step="1">
+          </label>
+          <label class="range-display-field">
+            <span>结束时间</span>
+            <input id="rangeTo" type="datetime-local" step="1">
+          </label>
+          <label class="metric-display-field">
+            <span>指标</span>
+            <select id="metricSelect">
+              <option value="total">DML 总行数</option>
+              <option value="insert">INSERT</option>
+              <option value="update">UPDATE</option>
+              <option value="delete">DELETE</option>
+            </select>
+          </label>
+          <div class="toolbar-actions">
+            <button id="applyRangeBtn" type="button" class="secondary">应用时间范围</button>
+            <button id="resetRangeBtn" type="button" class="ghost">重置</button>
+          </div>
+        </div>
+        <div id="rangeSubtitle" class="range-subtitle">当前范围：未设置</div>
+
+        <div class="timeline-overview">
+          <div id="summaryCards" class="summary-cards"></div>
+          <div class="timeline-meta-panel">
+            <div class="timeline-meta-title">辅助分析</div>
+            <div id="timelineMeta" class="timeline-meta"></div>
+          </div>
+        </div>
+        <div id="timelineFocus" class="timeline-focus">当前未选中时间桶</div>
+
+        <div class="chart-frame">
+          <svg id="timelineChart" viewBox="0 0 960 340" preserveAspectRatio="xMidYMid meet"></svg>
+          <div id="chartTooltip" class="chart-tooltip" hidden></div>
+        </div>
+        <div id="chartHint" class="chart-hint">提交任务后，这里会显示 DML 折线图。点击图上的时间桶可快速筛选该时间段。</div>
+      </section>
+
+      <section class="panel detail-panel">
+        <div class="panel-head">
+          <h2>时间段 DML 明细</h2>
+          <p id="detailRangeLabel">当前未选择时间范围</p>
+        </div>
+
+        <div class="toolbar detail-filter-toolbar">
+          <label>
+            <span>开始时间</span>
+            <input id="dmlFilterFrom" type="datetime-local" step="1">
+          </label>
+          <label>
+            <span>结束时间</span>
+            <input id="dmlFilterTo" type="datetime-local" step="1">
+          </label>
+          <label>
+            <span>类型</span>
+            <select id="dmlFilterType">
+              <option value="">全部</option>
+              <option value="INSERT">INSERT</option>
+              <option value="UPDATE">UPDATE</option>
+              <option value="DELETE">DELETE</option>
+            </select>
+          </label>
+          <label>
+            <span>库</span>
+            <input id="dmlFilterSchema" type="text" placeholder="schema">
+          </label>
+          <label>
+            <span>表</span>
+            <input id="dmlFilterTable" type="text" placeholder="table">
+          </label>
+          <label>
+            <span>行数</span>
+            <input id="dmlFilterRowCount" type="number" min="0" placeholder="精确匹配">
+          </label>
+          <label>
+            <span>事务字节</span>
+            <input id="dmlFilterTxnBytes" type="number" min="0" placeholder="最小值过滤">
+          </label>
+          <label>
+            <span>Binlog文件名</span>
+            <input id="dmlFilterBinlog" type="text" placeholder="支持包含匹配">
+          </label>
+          <label>
+            <span>GTID</span>
+            <input id="dmlFilterGTID" type="text" placeholder="支持包含匹配">
+          </label>
+          <div class="toolbar-actions">
+            <button id="applyDmlFilterBtn" type="button" class="secondary">应用筛选</button>
+            <button id="resetDmlFilterBtn" type="button" class="ghost">重置</button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>类型</th>
+                <th>库</th>
+                <th>表</th>
+                <th>行数</th>
+                <th>事务字节</th>
+                <th>Binlog</th>
+                <th>GTID</th>
+              </tr>
+            </thead>
+            <tbody id="dmlTableBody">
+              <tr><td colspan="8" class="empty-cell">暂无数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="pagination-bar">
+          <button id="prevPageBtn" type="button" class="ghost">上一页</button>
+          <span id="paginationInfo" class="pagination-info">第 0 / 0 页</span>
+          <button id="nextPageBtn" type="button" class="ghost">下一页</button>
+        </div>
+      </section>
+
+      <section class="panel aggregate-panel">
+        <div class="panel-head">
+          <h2>DML对象列表</h2>
+        </div>
+
+        <div class="table-wrap compact-table">
+          <table>
+            <thead>
+              <tr>
+                <th>库</th>
+                <th>表</th>
+                <th>INSERT</th>
+                <th>UPDATE</th>
+                <th>DELETE</th>
+                <th>总行数</th>
+              </tr>
+            </thead>
+            <tbody id="aggregateTableBody">
+              <tr><td colspan="6" class="empty-cell">暂无数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="pagination-bar">
+          <button id="prevAggregatePageBtn" type="button" class="ghost">上一页</button>
+          <span id="aggregatePaginationInfo" class="pagination-info">第 0 / 0 页</span>
+          <button id="nextAggregatePageBtn" type="button" class="ghost">下一页</button>
+        </div>
+
+        <div class="big-txn-box">
+          <div class="panel-head compact">
+            <h3>大事务列表</h3>
+          </div>
+          <div class="toolbar big-txn-toolbar">
+            <label>
+              <span>起始时间点</span>
+              <input id="bigTxnRangeFrom" type="datetime-local" step="1">
+            </label>
+            <label>
+              <span>结束时间点</span>
+              <input id="bigTxnRangeTo" type="datetime-local" step="1">
+            </label>
+            <div class="toolbar-actions">
+              <button id="applyBigTxnRangeBtn" type="button" class="secondary">应用时间范围</button>
+              <button id="resetBigTxnRangeBtn" type="button" class="ghost">重置</button>
+            </div>
+          </div>
+          <div id="bigTxnRangeLabel" class="chart-hint">当前大事务时间范围：未设置</div>
+          <div id="bigTxnStats" class="big-txn-stats"></div>
+          <div class="chart-frame small-chart-frame">
+            <svg id="bigTxnChart" viewBox="0 0 960 220" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
+          <div id="bigTxnHint" class="chart-hint">当前时间段暂无大事务数据</div>
+          <div class="toolbar big-txn-filter-toolbar">
+            <label>
+              <span>开始时间</span>
+              <input id="bigTxnFilterStart" type="datetime-local" step="1">
+            </label>
+            <label>
+              <span>结束时间</span>
+              <input id="bigTxnFilterEnd" type="datetime-local" step="1">
+            </label>
+            <label>
+              <span>Binlog</span>
+              <input id="bigTxnFilterBinlog" type="text" placeholder="支持包含匹配">
+            </label>
+            <label>
+              <span>对象</span>
+              <input id="bigTxnFilterTable" type="text" placeholder="支持包含匹配">
+            </label>
+            <label>
+              <span>GTID</span>
+              <input id="bigTxnFilterGTID" type="text" placeholder="支持包含匹配">
+            </label>
+            <label>
+              <span>事务字节</span>
+              <input id="bigTxnFilterBytes" type="number" min="0" placeholder="最小值过滤">
+            </label>
+            <div class="toolbar-actions">
+              <button id="applyBigTxnFilterBtn" type="button" class="secondary">应用筛选</button>
+              <button id="resetBigTxnFilterBtn" type="button" class="ghost">重置</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>开始时间</th>
+                  <th>结束时间</th>
+                  <th>影响行数</th>
+                  <th>事务字节</th>
+                  <th>Binlog</th>
+                  <th>对象</th>
+                  <th>GTID</th>
+                </tr>
+              </thead>
+              <tbody id="bigTxnTableBody">
+                <tr><td colspan="7" class="empty-cell">暂无大事务数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination-bar">
+            <button id="prevBigTxnPageBtn" type="button" class="ghost">上一页</button>
+            <span id="bigTxnPaginationInfo" class="pagination-info">第 0 / 0 页</span>
+            <button id="nextBigTxnPageBtn" type="button" class="ghost">下一页</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

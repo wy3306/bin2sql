@@ -28,6 +28,8 @@ func main() {
 	startFileFlag := flag.String("start-file", "", "手动指定起始 Binlog 文件名 (如果指定，将跳过自动查找)")
 	// 大事务分析阈值
 	bigTxnThreshold := flag.Int("big-txn-threshold", 0, "大事务行数阈值 (例如 1000)，0 表示不开启")
+	bigTxnMode := flag.String("big-txn-mode", "rows", "大事务判定模式: rows(按影响行数) 或 bytes(按事务占用字节大小)")
+	bigTxnBytesThreshold := flag.Uint64("big-txn-bytes-threshold", 0, "大事务字节阈值 (transaction_length，单位字节)，0 表示不开启")
 
 	// 解析命令行参数
 	flag.Parse()
@@ -37,6 +39,16 @@ func main() {
 		fmt.Println("请提供 -start-time 和 -end-time 参数")
 		flag.Usage() // 打印使用说明
 		os.Exit(1)
+	}
+	if *bigTxnMode != analyzer.BigTxnModeRows && *bigTxnMode != analyzer.BigTxnModeBytes {
+		fmt.Printf("错误: -big-txn-mode 只支持 %q 或 %q\n", analyzer.BigTxnModeRows, analyzer.BigTxnModeBytes)
+		os.Exit(1)
+	}
+	if *bigTxnMode == analyzer.BigTxnModeRows && *bigTxnBytesThreshold > 0 {
+		fmt.Println("提示: 当前为 rows 模式，-big-txn-bytes-threshold 将被忽略")
+	}
+	if *bigTxnMode == analyzer.BigTxnModeBytes && *bigTxnThreshold > 0 {
+		fmt.Println("提示: 当前为 bytes 模式，-big-txn-threshold 将被忽略")
 	}
 
 	// 处理密码逻辑：如果命令行未提供密码，则提示用户输入（隐藏显示）
@@ -111,15 +123,17 @@ func main() {
 
 	// 6. 初始化分析器
 	anaCfg := analyzer.Config{
-		Host:            *host,
-		Port:            *port,
-		User:            *user,
-		Password:        finalPassword, // 使用最终确定的密码
-		StartFile:       startFile,
-		BinlogFiles:     binlogFiles, // 传递文件列表
-		StartTime:       startTime,
-		EndTime:         endTime,
-		BigTxnThreshold: *bigTxnThreshold,
+		Host:                 *host,
+		Port:                 *port,
+		User:                 *user,
+		Password:             finalPassword, // 使用最终确定的密码
+		StartFile:            startFile,
+		BinlogFiles:          binlogFiles, // 传递文件列表
+		StartTime:            startTime,
+		EndTime:              endTime,
+		BigTxnThreshold:      *bigTxnThreshold,
+		BigTxnMode:           *bigTxnMode,
+		BigTxnBytesThreshold: *bigTxnBytesThreshold,
 	}
 
 	ana := analyzer.New(anaCfg)

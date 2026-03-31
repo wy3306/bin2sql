@@ -25,17 +25,24 @@ var ErrTimeOver = fmt.Errorf("binlog time is over end time")
 // 用于提取 LogPos 的正则表达式
 var logPosRegex = regexp.MustCompile(`LogPos:0x([0-9a-fA-F]+)`)
 
+const (
+	BigTxnModeRows  = "rows"
+	BigTxnModeBytes = "bytes"
+)
+
 // Config 定义分析器的配置参数
 type Config struct {
-	Host            string    // MySQL 主机地址
-	Port            int       // MySQL 端口
-	User            string    // MySQL 用户名
-	Password        string    // MySQL 密码
-	StartFile       string    // 起始 Binlog 文件名
-	BinlogFiles     []string  // 需要分析的 Binlog 文件列表 (用于多线程)
-	StartTime       time.Time // 分析的起始时间（包含）
-	EndTime         time.Time // 分析的结束时间（包含）
-	BigTxnThreshold int       // 大事务行数阈值，0 表示不开启
+	Host                 string    // MySQL 主机地址
+	Port                 int       // MySQL 端口
+	User                 string    // MySQL 用户名
+	Password             string    // MySQL 密码
+	StartFile            string    // 起始 Binlog 文件名
+	BinlogFiles          []string  // 需要分析的 Binlog 文件列表 (用于多线程)
+	StartTime            time.Time // 分析的起始时间（包含）
+	EndTime              time.Time // 分析的结束时间（包含）
+	BigTxnThreshold      int       // 大事务行数阈值，0 表示不开启
+	BigTxnMode           string    // 大事务判定模式: rows 或 bytes
+	BigTxnBytesThreshold uint64    // 大事务字节阈值，0 表示不开启
 }
 
 // TableStats 用于存储单个表的统计信息
@@ -53,6 +60,7 @@ type BigTxnInfo struct {
 	EndTime             time.Time // 事务结束时间
 	Gtid                string    // GTID (如果有)
 	Rows                int       // 影响行数
+	TransactionLength   uint64    // 事务占用字节大小（GTIDEvent.TransactionLength）
 	Tables              []string  // 涉及的表
 	OriginalCommitTime  time.Time // 原始提交时间 (Master)
 	ImmediateCommitTime time.Time // 提交时间 (Current)
@@ -70,6 +78,27 @@ type Analyzer struct {
 	bigTxns       []BigTxnInfo                      // 发现的大事务列表
 	bigTxnMu      sync.Mutex                        // 保护 bigTxns 的互斥锁
 	useChecksum   bool                              // 是否启用 Checksum 校验 (根据网络延迟动态决定)
+}
+
+func (a *Analyzer) normalizedBigTxnMode() string {
+	if a.cfg.BigTxnMode == BigTxnModeBytes {
+		return BigTxnModeBytes
+	}
+	return BigTxnModeRows
+}
+
+func (a *Analyzer) bigTxnEnabled() bool {
+	if a.normalizedBigTxnMode() == BigTxnModeBytes {
+		return a.cfg.BigTxnBytesThreshold > 0
+	}
+	return a.cfg.BigTxnThreshold > 0
+}
+
+func (a *Analyzer) isBigTransaction(rows int, txnBytes uint64) bool {
+	if a.normalizedBigTxnMode() == BigTxnModeBytes {
+		return a.cfg.BigTxnBytesThreshold > 0 && txnBytes >= a.cfg.BigTxnBytesThreshold
+	}
+	return a.cfg.BigTxnThreshold > 0 && rows >= a.cfg.BigTxnThreshold
 }
 
 // measureLatency 测量到目标主机的 TCP 连接延迟
@@ -397,6 +426,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 	var (
 		currTxnGtid                string
 		currTxnRows                int
+		currTxnTransactionLength   uint64
 		currTxnStartTime           time.Time
 		currTxnTables              = make(map[string]bool)
 		currTxnOriginalCommitTime  time.Time
@@ -409,6 +439,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 	resetTxn := func() {
 		currTxnGtid = ""
 		currTxnRows = 0
+		currTxnTransactionLength = 0
 		currTxnStartTime = time.Time{}
 		currTxnTables = make(map[string]bool)
 		currTxnOriginalCommitTime = time.Time{}
@@ -419,56 +450,58 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 
 	// 辅助函数：检查并记录大事务
 	checkBigTxn := func(endTime time.Time) {
-		if a.cfg.BigTxnThreshold > 0 && currTxnRows >= a.cfg.BigTxnThreshold {
-			tables := make([]string, 0, len(currTxnTables))
-			for t := range currTxnTables {
-				tables = append(tables, t)
-			}
-			sort.Strings(tables)
-
-			stmtTypes := make([]string, 0, len(currTxnStatementTypes))
-			for t := range currTxnStatementTypes {
-				stmtTypes = append(stmtTypes, t)
-			}
-			sort.Strings(stmtTypes)
-
-			// 如果开始时间未设置，使用结束时间作为近似
-			startTime := currTxnStartTime
-			if startTime.IsZero() {
-				startTime = endTime
-			}
-
-			// 优先使用高精度的原始提交时间作为结束时间
-			finalEndTime := endTime
-			if !currTxnOriginalCommitTime.IsZero() {
-				finalEndTime = currTxnOriginalCommitTime
-			}
-
-			// 再次检查时间顺序 (防止因时钟回拨或逻辑问题导致 Start > End)
-			if finalEndTime.Before(startTime) {
-				// 如果结束时间早于开始时间，这通常是不可能的（除非跨年/时钟回拨）
-				// 这种情况下，为了显示正常，强制让它们相等，或者保留原样但 Duration 会是负数
-				// 这里选择保留原样，让 Duration 显示负数或 0 可能更能提示问题，
-				// 但为了用户体验，我们让 End = Start + 1ms
-				// finalEndTime = startTime
-			}
-
-			a.addBigTxn(BigTxnInfo{
-				Filename:            filename,
-				StartTime:           startTime,
-				EndTime:             finalEndTime,
-				Gtid:                currTxnGtid,
-				Rows:                currTxnRows,
-				Tables:              tables,
-				OriginalCommitTime:  currTxnOriginalCommitTime,
-				ImmediateCommitTime: currTxnImmediateCommitTime,
-				StatementTypes:      stmtTypes,
-			})
+		if !a.isBigTransaction(currTxnRows, currTxnTransactionLength) {
+			return
 		}
+		tables := make([]string, 0, len(currTxnTables))
+		for t := range currTxnTables {
+			tables = append(tables, t)
+		}
+		sort.Strings(tables)
+
+		stmtTypes := make([]string, 0, len(currTxnStatementTypes))
+		for t := range currTxnStatementTypes {
+			stmtTypes = append(stmtTypes, t)
+		}
+		sort.Strings(stmtTypes)
+
+		// 如果开始时间未设置，使用结束时间作为近似
+		startTime := currTxnStartTime
+		if startTime.IsZero() {
+			startTime = endTime
+		}
+
+		// 优先使用高精度的原始提交时间作为结束时间
+		finalEndTime := endTime
+		if !currTxnOriginalCommitTime.IsZero() {
+			finalEndTime = currTxnOriginalCommitTime
+		}
+
+		// 再次检查时间顺序 (防止因时钟回拨或逻辑问题导致 Start > End)
+		if finalEndTime.Before(startTime) {
+			// 如果结束时间早于开始时间，这通常是不可能的（除非跨年/时钟回拨）
+			// 这种情况下，为了显示正常，强制让它们相等，或者保留原样但 Duration 会是负数
+			// 这里选择保留原样，让 Duration 显示负数或 0 可能更能提示问题，
+			// 但为了用户体验，我们让 End = Start + 1ms
+			// finalEndTime = startTime
+		}
+
+		a.addBigTxn(BigTxnInfo{
+			Filename:            filename,
+			StartTime:           startTime,
+			EndTime:             finalEndTime,
+			Gtid:                currTxnGtid,
+			Rows:                currTxnRows,
+			TransactionLength:   currTxnTransactionLength,
+			Tables:              tables,
+			OriginalCommitTime:  currTxnOriginalCommitTime,
+			ImmediateCommitTime: currTxnImmediateCommitTime,
+			StatementTypes:      stmtTypes,
+		})
 	}
 
 	// 性能优化：只有在开启大事务分析时才跟踪事务状态
-	trackBigTxn := a.cfg.BigTxnThreshold > 0
+	trackBigTxn := a.bigTxnEnabled()
 
 	for {
 		select {
@@ -563,6 +596,7 @@ func (a *Analyzer) processBinlogFile(filename string, serverID uint32) error {
 				u := e.SID
 				currTxnGtid = fmt.Sprintf("%x-%x-%x-%x-%x:%d",
 					u[0:4], u[4:6], u[6:8], u[8:10], u[10:], e.GNO)
+				currTxnTransactionLength = e.TransactionLength
 			}
 
 		case *replication.MariadbGTIDEvent:
@@ -780,7 +814,11 @@ func (a *Analyzer) PrintStats() {
 	// 打印大事务信息
 	a.bigTxnMu.Lock()
 	if len(a.bigTxns) > 0 {
-		fmt.Printf("\n=== 大事务分析报告 (阈值 > %d 行) ===\n", a.cfg.BigTxnThreshold)
+		if a.normalizedBigTxnMode() == BigTxnModeBytes {
+			fmt.Printf("\n=== 大事务分析报告 (阈值 > %d 字节) ===\n", a.cfg.BigTxnBytesThreshold)
+		} else {
+			fmt.Printf("\n=== 大事务分析报告 (阈值 > %d 行) ===\n", a.cfg.BigTxnThreshold)
+		}
 		fmt.Printf("共发现 %d 个大事务。\n", len(a.bigTxns))
 
 		// 按开始时间升序排序
@@ -797,7 +835,13 @@ func (a *Analyzer) PrintStats() {
 			defer file.Close()
 			fmt.Fprintf(file, "=== 大事务分析报告 ===\n")
 			fmt.Fprintf(file, "生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-			fmt.Fprintf(file, "行数阈值: %d\n", a.cfg.BigTxnThreshold)
+			if a.normalizedBigTxnMode() == BigTxnModeBytes {
+				fmt.Fprintf(file, "判定模式: %s\n", BigTxnModeBytes)
+				fmt.Fprintf(file, "字节阈值: %d\n", a.cfg.BigTxnBytesThreshold)
+			} else {
+				fmt.Fprintf(file, "判定模式: %s\n", BigTxnModeRows)
+				fmt.Fprintf(file, "行数阈值: %d\n", a.cfg.BigTxnThreshold)
+			}
 			fmt.Fprintf(file, "总数: %d\n\n", len(a.bigTxns))
 
 			for i, txn := range a.bigTxns {
@@ -826,6 +870,7 @@ func (a *Analyzer) PrintStats() {
 				}
 
 				fmt.Fprintf(file, "  影响行数:   %d\n", txn.Rows)
+				fmt.Fprintf(file, "  事务字节:   %d\n", txn.TransactionLength)
 				fmt.Fprintf(file, "  GTID:       %s\n", gtidStr)
 
 				if len(txn.StatementTypes) > 0 {
@@ -870,8 +915,8 @@ func (a *Analyzer) PrintStats() {
 				lagStr = fmt.Sprintf(" | 延迟: %s", lag.String())
 			}
 
-			fmt.Printf("[%d] %s | 行数: %d | 耗时: %s%s%s | 开始: %s\n",
-				i+1, txn.Filename, txn.Rows, durationStr, typesStr, lagStr, txn.StartTime.Format("2006-01-02 15:04:05.000000"))
+			fmt.Printf("[%d] %s | 行数: %d | 字节: %d | 耗时: %s%s%s | 开始: %s\n",
+				i+1, txn.Filename, txn.Rows, txn.TransactionLength, durationStr, typesStr, lagStr, txn.StartTime.Format("2006-01-02 15:04:05.000000"))
 		}
 		if len(a.bigTxns) > limit {
 			fmt.Printf("... 更多 %d 个大事务请查看报告文件 ...\n", len(a.bigTxns)-limit)
